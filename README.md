@@ -12,9 +12,8 @@ pip install cython
 
 git clone https://github.com/JDAI-CV/fast-reid.git
 
-
 conda install -c pytorch faiss-gpu
-(或可使用pycharm 安装）
+(or pycharm install）
 setPath 
  
 dataset/Market-1501-v15.09.15
