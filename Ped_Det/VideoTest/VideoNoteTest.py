@@ -995,7 +995,7 @@ while True:
 '''
 
 
-
+'''
 
 #+人数统计
 import os
@@ -1209,5 +1209,351 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+cap.release()
+cv2.destroyAllWindows()
+'''
+
+#增加动态权重
+import cv2
+import torch
+import numpy as np
+import time
+from ultralytics import YOLO
+from Ped_Det.VideoTest.utils import iou
+from FastReIDExtractor import FastReIDExtractor
+from scipy.optimize import linear_sum_assignment
+from tracker import Track
+
+#参数
+YOLO_MODEL = "yolov8n.pt"
+CONF_THRESH = 0.7
+PERSON_CLASS_ID = 0
+SIM_THRESHOLD = 0.7
+MAX_LOST = 30
+MAX_GALLERY = 100
+
+LINE_LEFT = 250
+LINE_RIGHT = 300
+
+count_in = 0
+count_out = 0
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#初始化
+detector = YOLO(YOLO_MODEL)
+
+reid_extractor = FastReIDExtractor(
+    config_file="D:/PedestrainDetection_Packet_Test/yolo_fastreid/fast-reid/configs/Market1501/bagtricks_R50.yml",
+    weight_path="D:/PedestrainDetection_Packet_Test/yolo_fastreid/output/model_best.pth"
+)
+reid_extractor.model.to(device).eval()
+VIDEO_PATH = "D:/PedestrainDetection_Packet_Test/yolo_fastreid/Video/CIJ.mp4"
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+#数据
+tracks = []
+next_id = 1
+gallery = []
+gallery_ids = []
+total_unique_ids = set()
+
+paused = False
+last_frame = None
+
+#function of tools
+def extract_embeddings_batch(model, crops):
+    if len(crops) == 0:
+        return np.array([])
+    imgs = [cv2.resize(cv2.cvtColor(c, cv2.COLOR_BGR2RGB), (128, 256)) for c in crops]
+    tensor = torch.from_numpy(np.array(imgs)).permute(0, 3, 1, 2).float().to(device)
+    with torch.no_grad():
+        feats = model(tensor).cpu().numpy()
+    feats /= np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12
+    return feats
+
+def find_in_gallery(feature, threshold=0.9):
+    if len(gallery) == 0:
+        return -1
+    sims = np.dot(np.array(gallery), feature)
+    idx = np.argmax(sims)
+    return gallery_ids[idx] if sims[idx] > threshold else -1
+
+def center_distance(box1, box2):
+    x1 = (box1[0] + box1[2]) / 2
+    y1 = (box1[1] + box1[3]) / 2
+    x2 = (box2[0] + box2[2]) / 2
+    y2 = (box2[1] + box2[3]) / 2
+    return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+def adaptive_weight(iou_score, reid_sim, dist):
+    """
+    动态权重融合策略
+    根据当前目标状态动态调整 ReID 与 IoU 权重
+    """
+    #遮挡/漂移场景
+    if iou_score < 0.3:
+        alpha = 0.85   # ReID权重大
+        beta = 0.10
+        gamma = 0.05
+    #正常稳定跟踪
+    elif iou_score >= 0.3 and dist < 80:
+
+        alpha = 0.65
+        beta = 0.30   # IoU主导
+        gamma = 0.05
+    # 中间状态
+    else:
+        alpha = 0.70
+        beta = 0.20
+        gamma = 0.10
+    return alpha, beta, gamma
+
+def compute_cost(tracks, detections, features):
+    cost = np.ones((len(tracks), len(detections)))  # 默认最大代价（不匹配）
+
+    for i, t in enumerate(tracks):
+        for j, d in enumerate(detections):
+
+            #空间距离约束
+            dist = center_distance(t.bbox, d)
+            #if dist > 120:   # 超过这个距离直接不可能匹配
+             #   continue
+            #IOU门控（防止乱匹配）
+            iou_score = iou(t.bbox, d)
+            if iou_score < 0.1:
+                continue
+            # 外观相似度
+            reid_sim = np.dot(t.feature, features[j])
+            # L2距离（特征空间）
+            l2_dist = np.linalg.norm(t.feature - features[j])
+            # 动态权重
+            alpha, beta, gamma = adaptive_weight(
+                iou_score,
+                reid_sim,
+                dist
+            )
+            # L2转相似度
+            l2_sim = 1 / (1 + l2_dist)
+            # 多特征动态融合
+            sim = (
+                    alpha * reid_sim +
+                    beta * iou_score +
+                    gamma * l2_sim
+            )
+
+            #转成cost
+            cost[i, j] = 1 - sim
+
+    return cost
+
+def resize_with_padding(frame, target_w=640, target_h=360):
+    h, w = frame.shape[:2]
+    scale = min(target_w / w, target_h / h)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    resized = cv2.resize(frame, (new_w, new_h))
+
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    #居中贴图
+    x_offset = (target_w - new_w) // 2
+    y_offset = (target_h - new_h) // 2
+
+    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+
+    return canvas
+
+def update_crossing(track):
+    global count_in, count_out
+
+    if len(track.trace) < 2:
+        return
+
+    x_now = track.trace[-1][0]
+
+    if track.state == "unknown":
+        if x_now < LINE_LEFT:
+            track.state = "left"
+        elif x_now > LINE_RIGHT:
+            track.state = "right"
+        return
+
+    if track.state == "left" and x_now > LINE_RIGHT:
+        if not track.counted:
+            count_in += 1
+            track.counted = True
+        track.state = "right"
+
+    elif track.state == "right" and x_now < LINE_LEFT:
+        if not track.counted:
+            count_out += 1
+            track.counted = True
+        track.state = "left"
+
+#鼠标按钮
+def mouse_callback(event, x, y, flags, param):
+    global paused
+
+    frame_w = param["frame_w"]
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if x > frame_w:
+            x_ui = x - frame_w
+
+            #Pause
+            if 20 < x_ui < 180 and 280 < y < 300:
+                paused = not paused
+
+            #Exit
+            if 20 < x_ui < 180 and 310 < y < 330:
+                exit()
+
+#窗口
+window_name = "Tracking System"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+prev_time = time.time()
+
+#主循环
+while True:
+
+    if not paused:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        last_frame = frame.copy()
+    else:
+        frame = last_frame.copy()
+
+    # FPS计算
+    curr_time = time.time()
+    fps = 1 / (curr_time - prev_time + 1e-6)
+    prev_time = curr_time
+
+
+
+    frame = resize_with_padding(frame, 640)
+
+    if not paused:
+        #检测
+        results = detector(frame, verbose=False)
+        boxes = results[0].boxes
+
+        detections, crops = [], []
+
+        if boxes is not None:
+            for box in boxes:
+                cls = int(box.cls.cpu().numpy()[0])
+                conf = float(box.conf.cpu().numpy()[0])
+                if cls != PERSON_CLASS_ID or conf < CONF_THRESH:
+                    continue
+
+                x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0].astype(int)
+                crop = frame[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+
+                detections.append([x1, y1, x2, y2])
+                crops.append(crop)
+
+        features = extract_embeddings_batch(reid_extractor.model, crops)
+
+        #预测
+        for t in tracks:
+            t.predict()
+
+        matched_d = set()
+
+        #匹配
+        if len(tracks) > 0 and len(features) > 0:
+            cost = compute_cost(tracks, detections, features)
+            row, col = linear_sum_assignment(cost)
+
+            matched_t = set()
+            for r, c in zip(row, col):
+                if 1 - cost[r, c] > SIM_THRESHOLD:
+                    tracks[r].update(detections[c], features[c])
+                    matched_t.add(r)
+                    matched_d.add(c)
+
+            for i, t in enumerate(tracks):
+                if i not in matched_t:
+                    t.lost += 1
+        else:
+            for t in tracks:
+                t.lost += 1
+
+        #新目标
+        for i, box in enumerate(detections):
+            if i in matched_d:
+                continue
+
+            if len(features) == 0:
+                continue
+
+            matched_id = find_in_gallery(features[i])
+
+            if matched_id != -1:
+                tracks.append(Track(matched_id, box, features[i]))
+            else:
+                tracks.append(Track(next_id, box, features[i]))
+                next_id += 1
+        #删除
+        new_tracks = []
+        for t in tracks:
+            if t.lost < MAX_LOST:
+                new_tracks.append(t)
+            else:
+                if len(t.trace) > 0 and not t.counted:
+                    x_last = t.trace[-1][0]
+                    if x_last < LINE_LEFT:
+                        count_out += 0.5
+                    elif x_last > LINE_RIGHT:
+                        count_in += 0.5
+
+                gallery.append(t.feature)
+                gallery_ids.append(t.id)
+        tracks = Track.deduplicate_tracks(new_tracks)
+        #统计
+        for t in tracks:
+            total_unique_ids.add(t.id)
+            update_crossing(t)
+    #绘制
+    for t in tracks:
+        x1, y1, x2, y2 = map(int, t.bbox)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"ID:{t.id}", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    #UI面板
+    h, w = frame.shape[:2]
+    ui = np.zeros((h, 300, 3), dtype=np.uint8)
+    cv2.putText(ui, "System Panel", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    cv2.putText(ui, f"FPS: {fps:.2f}", (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    cv2.putText(ui, f"Current: {len(tracks)}", (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(ui, f"Total: {len(total_unique_ids)}", (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(ui, f"IN: {int(count_in)}", (20, 200),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(ui, f"OUT: {int(count_out)}", (20, 240),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    # 按钮
+    cv2.rectangle(ui, (20, 280), (180, 300), (0, 128, 255), -1)
+    cv2.putText(ui, "Resume" if paused else "Pause",
+                (30, 295), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (255, 255, 255), 1)
+    cv2.rectangle(ui, (20, 310), (180, 330), (0, 0, 255), -1)
+    cv2.putText(ui, "Exit", (70, 325),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (255, 255, 255), 1)
+    combined = np.hstack((frame, ui))
+    cv2.setMouseCallback(window_name, mouse_callback, {"frame_w": w})
+    cv2.imshow(window_name, combined)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 cap.release()
 cv2.destroyAllWindows()
